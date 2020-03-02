@@ -43,7 +43,7 @@ import (
 )
 
 const (
-	NetVersionNum = 9 // This is temporary and will be removed soon after mainnet is stabilized
+	NetVersionNum = 11 // This is temporary and will be removed soon after mainnet is stabilized
 )
 
 var (
@@ -155,7 +155,12 @@ func nknMain(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	defer config.Parameters.ClearPortMapping()
+	defer func() {
+		err := config.Parameters.ClearPortMapping()
+		if err != nil {
+			log.Errorf("Error clear port mapping: %v", err)
+		}
+	}()
 
 	err = log.Init()
 	if err != nil {

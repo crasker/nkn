@@ -2,11 +2,16 @@ package chain
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"regexp"
 	"sync"
+
+	"github.com/nknorg/nkn/crypto/ed25519"
+
+	"github.com/nknorg/nkn/program"
 
 	. "github.com/nknorg/nkn/common"
 	"github.com/nknorg/nkn/crypto"
@@ -88,13 +93,14 @@ func checkAmountPrecise(amount Fixed64, precision byte) bool {
 	return amount.GetData()%int64(math.Pow(10, 8-float64(precision))) != 0
 }
 
-func verifyPubSubTopic(topic string) error {
-	match, err := regexp.MatchString("(^[A-Za-z][A-Za-z0-9-_.+]{2,254}$)", topic)
+func verifyPubSubTopic(topic string, height uint32) error {
+	regexPattern := config.AllowSubscribeTopicRegex.GetValueAtHeight(height)
+	match, err := regexp.MatchString(regexPattern, topic)
 	if err != nil {
 		return err
 	}
 	if !match {
-		return fmt.Errorf("topic %s should start with a letter, contain A-Za-z0-9-_.+ and have length 3-255", topic)
+		return fmt.Errorf("topic %s should match %s", topic, regexPattern)
 	}
 	return nil
 
@@ -144,15 +150,31 @@ func CheckTransactionPayload(txn *transaction.Transaction, height uint32) error 
 		if ok := config.AllowTxnRegisterName.GetValueAtHeight(height); !ok {
 			return errors.New("Register name transaction is not supported yet")
 		}
+
 		pld := payload.(*pb.RegisterName)
-		match, err := regexp.MatchString("(^[A-Za-z][A-Za-z0-9-_.+]{2,254}$)", pld.Name)
+		if !config.LegacyNameService.GetValueAtHeight(height) {
+			if Fixed64(pld.RegistrationFee) < Fixed64(config.MinNameRegistrationFee) {
+				return fmt.Errorf("registration fee %s is lower than MinNameRegistrationFee %d", string(pld.Registrant), config.MinNameRegistrationFee)
+			}
+		}
+		regexPattern := config.AllowNameRegex.GetValueAtHeight(height)
+		match, err := regexp.MatchString(regexPattern, pld.Name)
 		if err != nil {
 			return err
 		}
 		if !match {
-			return fmt.Errorf("name %s should start with a letter, contain A-Za-z0-9-_.+ and have length 3-255", pld.Name)
+			return fmt.Errorf("name %s should match regex %s", pld.Name, regexPattern)
+		}
+	case pb.TRANSFER_NAME_TYPE:
+		pld := payload.(*pb.TransferName)
+		if len(pld.Registrant) != ed25519.PublicKeySize {
+			return fmt.Errorf("registrant invalid")
 		}
 	case pb.DELETE_NAME_TYPE:
+		pld := payload.(*pb.DeleteName)
+		if len(pld.Registrant) != ed25519.PublicKeySize {
+			return fmt.Errorf("registrant invalid")
+		}
 	case pb.SUBSCRIBE_TYPE:
 		pld := payload.(*pb.Subscribe)
 
@@ -170,7 +192,7 @@ func CheckTransactionPayload(txn *transaction.Transaction, height uint32) error 
 			return fmt.Errorf("subscribe duration %d is greater than %d", pld.Duration, maxDuration)
 		}
 
-		if err = verifyPubSubTopic(pld.Topic); err != nil {
+		if err = verifyPubSubTopic(pld.Topic, height); err != nil {
 			return err
 		}
 
@@ -186,7 +208,7 @@ func CheckTransactionPayload(txn *transaction.Transaction, height uint32) error 
 	case pb.UNSUBSCRIBE_TYPE:
 		pld := payload.(*pb.Unsubscribe)
 
-		if err := verifyPubSubTopic(pld.Topic); err != nil {
+		if err := verifyPubSubTopic(pld.Topic, height); err != nil {
 			return err
 		}
 	case pb.GENERATE_ID_TYPE:
@@ -264,7 +286,7 @@ func CheckTransactionPayload(txn *transaction.Transaction, height uint32) error 
 }
 
 // VerifyTransactionWithLedger verifys a transaction with history transaction in ledger
-func VerifyTransactionWithLedger(txn *transaction.Transaction) error {
+func VerifyTransactionWithLedger(txn *transaction.Transaction, height uint32) error {
 	if DefaultLedger.Store.IsDoubleSpend(txn) {
 		return errors.New("[VerifyTransactionWithLedger] IsDoubleSpend check faild")
 	}
@@ -321,36 +343,97 @@ func VerifyTransactionWithLedger(txn *transaction.Transaction) error {
 		}
 
 		pld := payload.(*pb.RegisterName)
-		name, err := DefaultLedger.Store.GetName(pld.Registrant)
-		if name != "" {
-			return fmt.Errorf("pubKey %+v already has registered name %s", pld.Registrant, name)
+
+		if config.LegacyNameService.GetValueAtHeight(height) {
+			name, err := DefaultLedger.Store.GetName_legacy(pld.Registrant)
+			if name != "" {
+				return fmt.Errorf("pubKey %s already has registered name %s", hex.EncodeToString(pld.Registrant), name)
+			}
+			if err != nil {
+				return err
+			}
+
+			registrant, err := DefaultLedger.Store.GetRegistrant_legacy(pld.Name)
+			if registrant != nil {
+				return fmt.Errorf("name %s is already registered for pubKey %+v", pld.Name, registrant)
+			}
+			if err != nil {
+				return err
+			}
+		} else {
+			pk, err := crypto.DecodePoint(pld.Registrant)
+			if err != nil {
+				return err
+			}
+			addrHash, err := program.CreateProgramHash(pk)
+			if err != nil {
+				return err
+			}
+			balance := DefaultLedger.Store.GetBalance(addrHash)
+			if int64(balance) < pld.RegistrationFee+txn.UnsignedTx.Fee {
+				return errors.New("not sufficient funds")
+			}
+			registrant, _, err := DefaultLedger.Store.GetRegistrant(pld.Name)
+			if len(registrant) > 0 && !bytes.Equal(registrant, pld.Registrant) {
+				return fmt.Errorf("this name got registered")
+			}
 		}
+	case pb.TRANSFER_NAME_TYPE:
+		if err := checkNonce(); err != nil {
+			return err
+		}
+		pld := payload.(*pb.TransferName)
+
+		registrant, _, err := DefaultLedger.Store.GetRegistrant(pld.Name)
 		if err != nil {
 			return err
+		}
+		if len(registrant) == 0 {
+			return fmt.Errorf("can not transfer unregistered name")
+		}
+		if bytes.Equal(registrant, pld.Recipient) {
+			return fmt.Errorf("can not transfer names to its owner")
+		}
+		if !bytes.Equal(registrant, pld.Registrant) {
+			return fmt.Errorf("registrant incorrect")
+		}
+		senderPubkey, err := program.GetPublicKeyFromCode(txn.Programs[0].Code)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(registrant, senderPubkey) {
+			return fmt.Errorf("can not transfer names which did not belongs to you")
 		}
 
-		registrant, err := DefaultLedger.Store.GetRegistrant(pld.Name)
-		if registrant != nil {
-			return fmt.Errorf("name %s is already registered for pubKey %+v", pld.Name, registrant)
-		}
-		if err != nil {
-			return err
-		}
 	case pb.DELETE_NAME_TYPE:
 		if err := checkNonce(); err != nil {
 			return err
 		}
 
 		pld := payload.(*pb.DeleteName)
-		name, err := DefaultLedger.Store.GetName(pld.Registrant)
-		if err != nil {
-			return err
+		if config.LegacyNameService.GetValueAtHeight(height) {
+			name, err := DefaultLedger.Store.GetName_legacy(pld.Registrant)
+			if err != nil {
+				return err
+			}
+			if name == "" {
+				return fmt.Errorf("no name registered for pubKey %+v", pld.Registrant)
+			} else if name != pld.Name {
+				return fmt.Errorf("no name %s registered for pubKey %+v", pld.Name, pld.Registrant)
+			}
+		} else {
+			registrant, _, err := DefaultLedger.Store.GetRegistrant(pld.Name)
+			if err != nil {
+				return err
+			}
+			if len(registrant) == 0 {
+				return fmt.Errorf("name doesn't exist")
+			}
+			if !bytes.Equal(registrant, pld.Registrant) {
+				return fmt.Errorf("can not delete name which did not belongs to you")
+			}
 		}
-		if name == "" {
-			return fmt.Errorf("no name registered for pubKey %+v", pld.Registrant)
-		} else if name != pld.Name {
-			return fmt.Errorf("no name %s registered for pubKey %+v", pld.Name, pld.Registrant)
-		}
+
 	case pb.SUBSCRIBE_TYPE:
 		if err := checkNonce(); err != nil {
 			return err
@@ -406,7 +489,6 @@ func VerifyTransactionWithLedger(txn *transaction.Transaction) error {
 			return err
 		}
 
-		height := DefaultLedger.Store.GetHeight()
 		if height > pld.TxnExpiration {
 			return errors.New("nano pay txn has expired")
 		}
@@ -458,7 +540,7 @@ type nanoPay struct {
 }
 
 type BlockValidationState struct {
-	sync.Mutex
+	sync.RWMutex
 	txnlist                 map[Uint256]struct{}
 	totalAmount             map[Uint160]Fixed64
 	registeredNames         map[string]struct{}
@@ -542,7 +624,7 @@ func (bvs *BlockValidationState) GetSubscribersWithMeta(topic string) map[string
 	return subscribers
 }
 
-// VerifyTransactionWithBlock verifys a transaction with current transaction pool in memory
+// VerifyTransactionWithBlock verifies a transaction with current transaction pool in memory
 func (bvs *BlockValidationState) VerifyTransactionWithBlock(txn *transaction.Transaction, height uint32) (e error) {
 	//1.check weather have duplicate transaction.
 	if _, exist := bvs.txnlist[txn.Hash()]; exist {
@@ -593,15 +675,29 @@ func (bvs *BlockValidationState) VerifyTransactionWithBlock(txn *transaction.Tra
 		}
 
 		registrant := BytesToHexString(namePayload.Registrant)
-		if _, ok := bvs.nameRegistrants[registrant]; ok {
-			return errors.New("[VerifyTransactionWithBlock] duplicate registrant exist in block")
+		if config.LegacyNameService.GetValueAtHeight(height) {
+			if _, ok := bvs.nameRegistrants[registrant]; ok {
+				return errors.New("[VerifyTransactionWithBlock] duplicate registrant exist in block")
+			}
 		}
+		amount = Fixed64(namePayload.RegistrationFee)
 
 		defer func() {
 			if e == nil {
 				bvs.addChange(func() {
 					bvs.registeredNames[name] = struct{}{}
 					bvs.nameRegistrants[registrant] = struct{}{}
+				})
+			}
+		}()
+	case pb.TRANSFER_NAME_TYPE:
+		namePayload := payload.(*pb.TransferName)
+		name := namePayload.Name
+
+		defer func() {
+			if e == nil {
+				bvs.addChange(func() {
+					bvs.registeredNames[name] = struct{}{}
 				})
 			}
 		}()
@@ -614,8 +710,10 @@ func (bvs *BlockValidationState) VerifyTransactionWithBlock(txn *transaction.Tra
 		}
 
 		registrant := BytesToHexString(namePayload.Registrant)
-		if _, ok := bvs.nameRegistrants[registrant]; ok {
-			return errors.New("[VerifyTransactionWithBlock] duplicate registrant exist in block")
+		if config.LegacyNameService.GetValueAtHeight(height) {
+			if _, ok := bvs.nameRegistrants[registrant]; ok {
+				return errors.New("[VerifyTransactionWithBlock] duplicate registrant exist in block")
+			}
 		}
 
 		defer func() {
@@ -771,12 +869,19 @@ func (bvs *BlockValidationState) CleanSubmittedTransactions(txns []*transaction.
 			amount = Fixed64(transfer.Amount)
 		case pb.REGISTER_NAME_TYPE:
 			namePayload := payload.(*pb.RegisterName)
+			amount = Fixed64(namePayload.RegistrationFee)
 
 			name := namePayload.Name
 			delete(bvs.registeredNames, name)
 
 			registrant := BytesToHexString(namePayload.Registrant)
 			delete(bvs.nameRegistrants, registrant)
+
+		case pb.TRANSFER_NAME_TYPE:
+			namePayload := payload.(*pb.TransferName)
+			name := namePayload.Name
+			delete(bvs.registeredNames, name)
+
 		case pb.DELETE_NAME_TYPE:
 			namePayload := payload.(*pb.DeleteName)
 
@@ -838,13 +943,14 @@ func (bvs *BlockValidationState) CleanSubmittedTransactions(txns []*transaction.
 	return nil
 }
 
-func (bvs *BlockValidationState) RefreshBlockValidationState(txns []*transaction.Transaction) error {
+func (bvs *BlockValidationState) RefreshBlockValidationState(txns []*transaction.Transaction) map[Uint256]error {
 	bvs.initBlockValidationState()
+	errMap := make(map[Uint256]error, 0)
 	for _, tx := range txns {
 		if err := bvs.VerifyTransactionWithBlock(tx, 0); err != nil {
-			return err
+			errMap[tx.Hash()] = err
 		}
 	}
-
-	return nil
+	bvs.Commit()
+	return errMap
 }

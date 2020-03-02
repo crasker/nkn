@@ -105,7 +105,7 @@ func (bm *BuiltinMining) BuildBlock(ctx context.Context, height uint32, chordID 
 			break
 		}
 
-		if txn.UnsignedTx.Fee < int64(config.Parameters.MinTxnFee) && isLowFeeTxnFull(lowFeeTxCount+1, lowFeeTxSize+txn.GetSize()) {
+		if txn.UnsignedTx.Fee < config.Parameters.MinTxnFee && isLowFeeTxnFull(lowFeeTxCount+1, lowFeeTxSize+txn.GetSize()) {
 			log.Info("Low fee transaction full in block")
 			break
 		}
@@ -115,7 +115,7 @@ func (bm *BuiltinMining) BuildBlock(ctx context.Context, height uint32, chordID 
 			txnCollection.Pop()
 			continue
 		}
-		if err := VerifyTransactionWithLedger(txn); err != nil {
+		if err := VerifyTransactionWithLedger(txn, height); err != nil {
 			log.Warningf("invalid transaction: %v", err)
 			txnCollection.Pop()
 			continue
