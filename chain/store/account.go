@@ -7,6 +7,8 @@ import (
 	"io"
 	"sort"
 
+	"github.com/nknorg/nkn/v2/config"
+
 	"github.com/nknorg/nkn/v2/common"
 	"github.com/nknorg/nkn/v2/common/serialization"
 )
@@ -66,6 +68,7 @@ type account struct {
 	nonce    uint64
 	balances map[common.Uint256]*balance
 	id       []byte
+	id2      []byte
 }
 
 func NewAccount(n uint64, b *balance, id []byte) *account {
@@ -106,6 +109,15 @@ func (acc *account) Serialize(w io.Writer) error {
 		return fmt.Errorf("account id Serialize error: %v", err)
 	}
 
+	if len(acc.id2) > 0 {
+		if err := serialization.WriteVarBytes(w, []byte("0")); err != nil {
+			return fmt.Errorf("account id Serialize error: %v", err)
+		}
+		if err := serialization.WriteVarBytes(w, acc.id2); err != nil {
+			return fmt.Errorf("account id Serialize error: %v", err)
+		}
+	}
+
 	return nil
 }
 
@@ -140,6 +152,16 @@ func (acc *account) Deserialize(r io.Reader) error {
 	}
 	acc.id = id
 
+	_, err = serialization.ReadVarBytes(r) // check if id2flag exists
+	if err != nil {
+		return nil
+	}
+	id2, err := serialization.ReadVarBytes(r)
+	if err != nil {
+		return fmt.Errorf("Deserialize id error:%v", err)
+	}
+	acc.id2 = id2
+
 	return nil
 }
 
@@ -157,6 +179,10 @@ func (acc *account) GetBalance(assetID common.Uint256) common.Fixed64 {
 
 func (acc *account) GetID() []byte {
 	return acc.id
+}
+
+func (acc *account) GetID2() []byte {
+	return acc.id2
 }
 
 func (acc *account) SetNonce(nonce uint64) {
@@ -177,6 +203,10 @@ func (acc *account) SetBalance(assetID common.Uint256, amount common.Fixed64) {
 
 func (acc *account) SetID(id []byte) {
 	acc.id = id
+}
+
+func (acc *account) SetID2(id []byte) {
+	acc.id2 = id
 }
 
 func (acc *account) Empty() bool {
@@ -224,13 +254,23 @@ func (sdb *StateDB) GetNonce(addr common.Uint160) uint64 {
 	return account.GetNonce()
 }
 
-func (sdb *StateDB) GetID(addr common.Uint160) []byte {
+func (sdb *StateDB) GetID(addr common.Uint160, height uint32) []byte {
 	account, err := sdb.getAccount(addr)
 	if err != nil {
 		return nil
 	}
-
-	return account.GetID()
+	IDGenerationStage := config.NewIDGeneretionStage.GetValueAtHeight(height)
+	if IDGenerationStage == config.GenerateID2NotStarted {
+		return account.GetID()
+	}
+	if IDGenerationStage == config.GenerateID2Allowed {
+		id2 := account.GetID2()
+		if len(id2) > 0 {
+			return id2
+		}
+		return account.GetID()
+	}
+	return account.GetID2()
 }
 
 func (sdb *StateDB) SetAccount(addr common.Uint160, acc *account) {
@@ -336,6 +376,13 @@ func (sdb *StateDB) IncrNonce(addr common.Uint160) error {
 func (sdb *StateDB) UpdateID(addr common.Uint160, id []byte) error {
 	acc := sdb.GetOrNewAccount(addr)
 	acc.SetID(id)
+
+	return nil
+}
+
+func (sdb *StateDB) UpdateID2(addr common.Uint160, id []byte) error {
+	acc := sdb.GetOrNewAccount(addr)
+	acc.SetID2(id)
 
 	return nil
 }
