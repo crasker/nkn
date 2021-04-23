@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"net/http"
 	_ "net/http/pprof"
@@ -125,7 +126,7 @@ func AskMyIP(seeds []string) (string, error) {
 		if err == nil {
 			return addr, err
 		}
-		log.Warningf("Ask my ID from %s met error: %v", seed, err)
+		log.Warningf("Ask my ID from %s error: %v", seed, err)
 	}
 	return "", errors.New("Tried all seeds but can't got my external IP and nknID")
 }
@@ -237,7 +238,12 @@ func nknMain(c *cli.Context) error {
 	// if InitLedger return err, chain.DefaultLedger is uninitialized.
 	defer chain.DefaultLedger.Store.Close()
 
-	id, err := GetOrCreateID(config.Parameters.SeedList, wallet, common.Fixed64(config.Parameters.RegisterIDRegFee), common.Fixed64(config.Parameters.RegisterIDTxnFee))
+	id, err := GetOrCreateID(
+		config.Parameters.SeedList,
+		wallet,
+		common.Fixed64(config.Parameters.RegisterIDTxnFee),
+		createMode,
+	)
 	if err != nil {
 		log.Fatalf("Get or create id error: %v", err)
 	}
@@ -501,9 +507,15 @@ func main() {
 	}
 }
 
-func GetID(seeds []string, publickey []byte) ([]byte, error) {
-	id, err := chain.DefaultLedger.Store.GetID(publickey)
-	if err == nil && len(id) != 0 {
+func GetID(seeds []string, publickey []byte, createMode bool) ([]byte, error) {
+	// Get future ID assuming ID will not expire
+	height := uint32(math.MaxUint32)
+	if createMode {
+		height = chain.DefaultLedger.Store.GetHeight()
+	}
+
+	id, err := chain.DefaultLedger.Store.GetID(publickey, height)
+	if err == nil && len(id) > 0 && !bytes.Equal(id, crypto.Sha256ZeroHash) {
 		return id, nil
 	}
 
@@ -511,6 +523,9 @@ func GetID(seeds []string, publickey []byte) ([]byte, error) {
 		log.Errorf("get ID from local ledger error: %v", err)
 	} else {
 		log.Infof("get no ID from local ledger")
+	}
+	if createMode {
+		return nil, errors.New("no ID in local ledger")
 	}
 
 	rand.Shuffle(len(seeds), func(i int, j int) {
@@ -544,7 +559,7 @@ func GetID(seeds []string, publickey []byte) ([]byte, error) {
 	return nil, fmt.Errorf("failed to get ID from majority of %d seeds", n)
 }
 
-func CreateID(seeds []string, wallet *vault.Wallet, regFee, txnFee common.Fixed64) error {
+func CreateID(seeds []string, wallet *vault.Wallet, txnFee common.Fixed64) error {
 	account, err := wallet.GetDefaultAccount()
 	if err != nil {
 		return err
@@ -565,13 +580,12 @@ func CreateID(seeds []string, wallet *vault.Wallet, regFee, txnFee common.Fixed6
 	for _, seed := range seeds {
 		nonce, height, err := client.GetNonceByAddr(seed, addr)
 		if err != nil {
-			log.Warningf("get nonce from %s met error: %v", seed, err)
+			log.Warningf("get nonce from %s error: %v", seed, err)
 			continue
 		}
 
 		if txn == nil || nonce != prevNonce {
-			log.Info("Creating generate ID txn. This process may take quite a few minutes...")
-			txn, err = api.MakeGenerateIDTransaction(context.Background(), wallet, regFee, nonce, txnFee, config.MaxGenerateIDTxnHash.GetValueAtHeight(height+1))
+			txn, err = api.MakeGenerateIDTransaction(context.Background(), nil, wallet, 0, nonce, txnFee, height)
 			if err != nil {
 				return err
 			}
@@ -585,7 +599,7 @@ func CreateID(seeds []string, wallet *vault.Wallet, regFee, txnFee common.Fixed6
 
 		_, err = client.CreateID(seed, hex.EncodeToString(buff))
 		if err != nil {
-			log.Warningf("create ID from %s met error: %v", seed, err)
+			log.Warningf("create ID from %s error: %v", seed, err)
 			continue
 		}
 
@@ -595,25 +609,36 @@ func CreateID(seeds []string, wallet *vault.Wallet, regFee, txnFee common.Fixed6
 	return errors.New("create ID failed")
 }
 
-func GetOrCreateID(seeds []string, wallet *vault.Wallet, regFee, txnFee common.Fixed64) ([]byte, error) {
+func GetOrCreateID(seeds []string, wallet *vault.Wallet, txnFee common.Fixed64, createMode bool) ([]byte, error) {
 	account, err := wallet.GetDefaultAccount()
 	if err != nil {
 		return nil, err
 	}
 	pk := account.PubKey()
 
-	id, err := GetID(seeds, pk)
-	if err != nil || id == nil {
-		if err != nil {
-			log.Warningf("Get id from neighbors error: %v", err)
+	for {
+		id, err := GetID(seeds, pk, createMode)
+		if err != nil || len(id) == 0 {
+			if createMode {
+				return nil, err
+			}
+			if err != nil {
+				log.Warningf("Get ID from neighbors error: %v", err)
+			}
+			serviceConfig.Status = serviceConfig.Status | serviceConfig.SERVICE_STATUS_CREATE_ID
+			if err := CreateID(seeds, wallet, txnFee); err != nil {
+				log.Warningf("Create ID error: %v", err)
+				log.Warningf("Failed to create ID. Make sure node's wallet address has enough balance for generate ID fee, or use another wallet to generate ID for this node's public key.")
+				time.Sleep(10 * time.Minute)
+				continue
+			}
+			break
+		} else if len(id) != config.NodeIDBytes {
+			return nil, fmt.Errorf("Got ID %x from neighbors with wrong size, expecting %d bytes", id, config.NodeIDBytes)
+		} else if bytes.Equal(id, crypto.Sha256ZeroHash) {
+			log.Info("Waiting for ID generation to complete")
+			break
 		}
-		serviceConfig.Status = serviceConfig.Status | serviceConfig.SERVICE_STATUS_CREATE_ID
-		if err := CreateID(seeds, wallet, regFee, txnFee); err != nil {
-			return nil, err
-		}
-	} else if len(id) != config.NodeIDBytes {
-		return nil, fmt.Errorf("Got id %x from neighbors with wrong size, expecting %d bytes", id, config.NodeIDBytes)
-	} else if !bytes.Equal(id, crypto.Sha256ZeroHash) {
 		return id, nil
 	}
 
@@ -625,13 +650,13 @@ out:
 	for {
 		select {
 		case <-timer.C:
-			log.Warningf("try to get ID from local ledger and remoteNode...")
-			if id, err := GetID(seeds, pk); err == nil && id != nil {
+			log.Infof("Try to get ID from local ledger and remoteNode...")
+			if id, err := GetID(seeds, pk, false); err == nil && id != nil {
 				if !bytes.Equal(id, crypto.Sha256ZeroHash) {
 					return id, nil
 				}
 			} else if err != nil {
-				log.Warningf("Get id from neighbors error: %v", err)
+				log.Warningf("Get ID from neighbors error: %v", err)
 			}
 			timer.Reset(config.ConsensusDuration)
 		case <-timeout:

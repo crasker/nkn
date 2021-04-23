@@ -1,8 +1,12 @@
 package common
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+
+	"github.com/nknorg/nkn/v2/config"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/nknorg/nkn/v2/common"
@@ -150,17 +154,42 @@ func MakeUnsubscribeTransaction(wallet *vault.Wallet, identifier string, topic s
 	return txn, nil
 }
 
-func MakeGenerateIDTransaction(ctx context.Context, wallet *vault.Wallet, regFee common.Fixed64, nonce uint64, txnFee common.Fixed64, maxTxnHash common.Uint256) (*transaction.Transaction, error) {
+func MakeGenerateIDTransaction(ctx context.Context, pubkey []byte, wallet *vault.Wallet, regFee common.Fixed64, nonce uint64, txnFee common.Fixed64, height uint32) (*transaction.Transaction, error) {
+	minVersion := config.AllowTxnGenerateIDMinVersion.GetValueAtHeight(height + 1)
+	maxVersion := config.AllowTxnGenerateIDMaxVersion.GetValueAtHeight(height + 1)
+	if maxVersion < minVersion {
+		return nil, fmt.Errorf("no available ID version at height %d", height+1)
+	}
+
 	account, err := wallet.GetDefaultAccount()
 	if err != nil {
 		return nil, err
 	}
-	pubkey := account.PubKey()
+	myPubkey := account.PubKey()
+
+	if len(pubkey) == 0 {
+		pubkey = myPubkey
+	}
+
+	var sender []byte
+	if config.AllowGenerateIDSender.GetValueAtHeight(height + 1) {
+		sender = account.ProgramHash.ToArray()
+	} else {
+		if !bytes.Equal(pubkey, myPubkey) {
+			return nil, errors.New("cannot generate ID for another pubkey at this height")
+		}
+	}
+
+	if regFee == 0 {
+		regFee = common.Fixed64(config.MinGenIDRegistrationFee.GetValueAtHeight(height + 1))
+	}
+	maxTxnHash := config.MaxGenerateIDTxnHash.GetValueAtHeight(height + 1)
 
 	var txn *transaction.Transaction
 	var txnHash common.Uint256
 	var i uint64
 	maxUint64 := ^uint64(0)
+
 	for i = uint64(0); i < maxUint64; i++ {
 		select {
 		case <-ctx.Done():
@@ -168,7 +197,7 @@ func MakeGenerateIDTransaction(ctx context.Context, wallet *vault.Wallet, regFee
 		default:
 		}
 
-		txn, err = transaction.NewGenerateIDTransaction(pubkey, regFee, nonce, txnFee, proto.EncodeVarint(i))
+		txn, err = transaction.NewGenerateIDTransaction(pubkey, sender, regFee, maxVersion, nonce, txnFee, proto.EncodeVarint(i))
 		if err != nil {
 			return nil, err
 		}

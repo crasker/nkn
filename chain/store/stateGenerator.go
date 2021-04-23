@@ -138,7 +138,12 @@ func (cs *ChainStore) spendTransaction(states *StateDB, txn *transaction.Transac
 			return err
 		}
 
-		if err = states.UpdateID(pg[0], crypto.Sha256ZeroHash); err != nil {
+		idPg, err := program.CreateProgramHash(genID.PublicKey)
+		if err != nil {
+			return err
+		}
+
+		if err = states.UpdateID(idPg, crypto.Sha256ZeroHash, byte(genID.Version)); err != nil {
 			return err
 		}
 
@@ -213,7 +218,7 @@ func (cs *ChainStore) generateStateRoot(ctx context.Context, b *block.Block, gen
 			return nil, common.EmptyUint256, err
 		}
 
-		if err = states.UpdateID(programHash, b.Header.UnsignedHeader.SignerId); err != nil {
+		if err = states.UpdateID(programHash, b.Header.UnsignedHeader.SignerId, 0); err != nil {
 			return nil, common.EmptyUint256, err
 		}
 
@@ -248,22 +253,29 @@ func (cs *ChainStore) generateStateRoot(ctx context.Context, b *block.Block, gen
 		preBlockHash := prevBlock.Hash()
 
 		for _, txn := range prevBlock.Transactions {
-			if txn.UnsignedTx.Payload.Type == pb.PayloadType_GENERATE_ID_TYPE {
+			switch txn.UnsignedTx.Payload.Type {
+			case pb.PayloadType_GENERATE_ID_TYPE:
 				select {
 				case <-ctx.Done():
-					return nil, common.EmptyUint256, errors.New("context deadline exceeded")
+					return nil, common.EmptyUint256, ctx.Err()
 				default:
 				}
 
 				id := block.ComputeID(preBlockHash, txn.Hash(), b.Header.UnsignedHeader.RandomBeacon[:config.RandomBeaconUniqueLength])
 
-				var pg []common.Uint160
-				pg, err = txn.GetProgramHashes()
+				pl, err := transaction.Unpack(txn.UnsignedTx.Payload)
 				if err != nil {
 					return nil, common.EmptyUint256, err
 				}
 
-				if err = states.UpdateID(pg[0], id); err != nil {
+				genID := pl.(*pb.GenerateID)
+
+				idPg, err := program.CreateProgramHash(genID.PublicKey)
+				if err != nil {
+					return nil, common.EmptyUint256, err
+				}
+
+				if err = states.UpdateID(idPg, id, byte(genID.Version)); err != nil {
 					return nil, common.EmptyUint256, err
 				}
 			}

@@ -7,6 +7,8 @@ import (
 	"io"
 	"sort"
 
+	"github.com/nknorg/nkn/v2/config"
+
 	"github.com/nknorg/nkn/v2/common"
 	"github.com/nknorg/nkn/v2/common/serialization"
 )
@@ -63,9 +65,10 @@ func (b *balance) Deserialize(r io.Reader) error {
 }
 
 type account struct {
-	nonce    uint64
-	balances map[common.Uint256]*balance
-	id       []byte
+	nonce     uint64
+	balances  map[common.Uint256]*balance
+	id        []byte
+	idVersion byte
 }
 
 func NewAccount(n uint64, b *balance, id []byte) *account {
@@ -102,7 +105,12 @@ func (acc *account) Serialize(w io.Writer) error {
 		}
 	}
 
-	if err := serialization.WriteVarBytes(w, acc.id); err != nil {
+	id := acc.id
+	if acc.idVersion > 0 {
+		id = append([]byte{acc.idVersion}, id...)
+	}
+
+	if err := serialization.WriteVarBytes(w, id); err != nil {
 		return fmt.Errorf("account id Serialize error: %v", err)
 	}
 
@@ -112,7 +120,7 @@ func (acc *account) Serialize(w io.Writer) error {
 func (acc *account) Deserialize(r io.Reader) error {
 	nonce, err := serialization.ReadVarUint(r, 0)
 	if err != nil {
-		return fmt.Errorf("Deserialize nonce error:%v", err)
+		return fmt.Errorf("deserialize nonce error: %v", err)
 	}
 	acc.nonce = nonce
 
@@ -122,23 +130,31 @@ func (acc *account) Deserialize(r io.Reader) error {
 
 	balanceSize, err := serialization.ReadVarUint(r, 0)
 	if err != nil {
-		return fmt.Errorf("Deserialize length of balances error:%v", err)
+		return fmt.Errorf("deserialize length of balances error: %v", err)
 	}
 
 	for i := 0; i < int(balanceSize); i++ {
 		var b balance
 		err := b.Deserialize(r)
 		if err != nil {
-			return fmt.Errorf("Deserialize balances error:%v", err)
+			return fmt.Errorf("deserialize balances error: %v", err)
 		}
 		acc.balances[b.assetID] = &b
 	}
 
 	id, err := serialization.ReadVarBytes(r)
 	if err != nil {
-		return fmt.Errorf("Deserialize id error:%v", err)
+		return fmt.Errorf("deserialize id error: %v", err)
 	}
+
+	var idVersion byte
+	if len(id) == config.NodeIDBytes+1 {
+		idVersion = id[0]
+		id = id[1:]
+	}
+
 	acc.id = id
+	acc.idVersion = idVersion
 
 	return nil
 }
@@ -155,8 +171,15 @@ func (acc *account) GetBalance(assetID common.Uint256) common.Fixed64 {
 	return acc.balances[assetID].amount
 }
 
-func (acc *account) GetID() []byte {
-	return acc.id
+func (acc *account) GetID(height uint32) []byte {
+	if int32(acc.idVersion) >= config.AllowGetIDMinVersion.GetValueAtHeight(height) && int32(acc.idVersion) <= config.AllowGetIDMaxVersion.GetValueAtHeight(height) {
+		return acc.id
+	}
+	return nil
+}
+
+func (acc *account) GetIDVersion() ([]byte, byte) {
+	return acc.id, acc.idVersion
 }
 
 func (acc *account) SetNonce(nonce uint64) {
@@ -175,8 +198,9 @@ func (acc *account) SetBalance(assetID common.Uint256, amount common.Fixed64) {
 	acc.balances[assetID].amount = amount
 }
 
-func (acc *account) SetID(id []byte) {
+func (acc *account) SetID(id []byte, version byte) {
 	acc.id = id
+	acc.idVersion = version
 }
 
 func (acc *account) Empty() bool {
@@ -224,13 +248,22 @@ func (sdb *StateDB) GetNonce(addr common.Uint160) uint64 {
 	return account.GetNonce()
 }
 
-func (sdb *StateDB) GetID(addr common.Uint160) []byte {
+func (sdb *StateDB) GetID(addr common.Uint160, height uint32) []byte {
 	account, err := sdb.getAccount(addr)
 	if err != nil {
 		return nil
 	}
 
-	return account.GetID()
+	return account.GetID(height)
+}
+
+func (sdb *StateDB) GetIDVersion(addr common.Uint160) ([]byte, byte) {
+	account, err := sdb.getAccount(addr)
+	if err != nil {
+		return nil, 0
+	}
+
+	return account.GetIDVersion()
 }
 
 func (sdb *StateDB) SetAccount(addr common.Uint160, acc *account) {
@@ -296,13 +329,13 @@ func (sdb *StateDB) SetNonce(addr common.Uint160, nonce uint64) error {
 	return nil
 }
 
-func (sdb *StateDB) SetID(addr common.Uint160, id []byte) error {
+func (sdb *StateDB) SetID(addr common.Uint160, id []byte, version byte) error {
 	account, err := sdb.getAccount(addr)
 	if err != nil {
 		return err
 	}
 
-	account.SetID(id)
+	account.SetID(id, version)
 	return nil
 }
 
@@ -333,9 +366,9 @@ func (sdb *StateDB) IncrNonce(addr common.Uint160) error {
 	return nil
 }
 
-func (sdb *StateDB) UpdateID(addr common.Uint160, id []byte) error {
+func (sdb *StateDB) UpdateID(addr common.Uint160, id []byte, version byte) error {
 	acc := sdb.GetOrNewAccount(addr)
-	acc.SetID(id)
+	acc.SetID(id, version)
 
 	return nil
 }

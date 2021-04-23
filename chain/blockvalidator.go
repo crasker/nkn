@@ -341,8 +341,7 @@ func SignerCheck(header *block.Header) error {
 	if len(chordID) > 0 && !bytes.Equal(header.UnsignedHeader.SignerId, chordID) {
 		return fmt.Errorf("invalid block signer chord ID %x, should be %x", header.UnsignedHeader.SignerId, chordID)
 	}
-
-	id, err := DefaultLedger.Store.GetID(publicKey)
+	id, err := DefaultLedger.Store.GetID(publicKey, currentHeight)
 	if err != nil {
 		return fmt.Errorf("get ID of signer %x error: %v", publicKey, err)
 	}
@@ -558,10 +557,14 @@ func VerifyTransactionWithLedger(txn *transaction.Transaction, height uint32) er
 			return err
 		}
 
-		donationProgramhash, _ := common.ToScriptHash(config.DonationAddress)
-		amount := DefaultLedger.Store.GetBalance(donationProgramhash)
-		if amount < donationAmount {
-			return errors.New("not sufficient funds in doation account")
+		donationProgramhash, err := common.ToScriptHash(config.DonationAddress)
+		if err != nil {
+			return err
+		}
+
+		donationBalance := DefaultLedger.Store.GetBalance(donationProgramhash)
+		if donationBalance < donationAmount {
+			return errors.New("not sufficient funds in donation account")
 		}
 	case pb.PayloadType_TRANSFER_ASSET_TYPE:
 		pld := payload.(*pb.TransferAsset)
@@ -651,7 +654,7 @@ func VerifyTransactionWithLedger(txn *transaction.Transaction, height uint32) er
 			return err
 		}
 		if !subscribed && config.MaxSubscriptionsCount > 0 {
-			subscriptionCount := DefaultLedger.Store.GetSubscribersCount(pld.Topic, pld.Bucket)
+			subscriptionCount := DefaultLedger.Store.GetSubscribersCount(pld.Topic, pld.Bucket, nil)
 			if subscriptionCount >= config.MaxSubscriptionsCount {
 				return fmt.Errorf("subscription count to %s can't be more than %d", pld.Topic, config.MaxSubscriptionsCount)
 			}
@@ -667,11 +670,11 @@ func VerifyTransactionWithLedger(txn *transaction.Transaction, height uint32) er
 		}
 	case pb.PayloadType_GENERATE_ID_TYPE:
 		pld := payload.(*pb.GenerateID)
-		id, err := DefaultLedger.Store.GetID(pld.PublicKey)
+		id, idVersion, err := DefaultLedger.Store.GetIDVersion(pld.PublicKey)
 		if err != nil {
 			return err
 		}
-		if len(id) != 0 {
+		if len(id) > 0 && pld.Version <= int32(idVersion) {
 			return ErrIDRegistered
 		}
 		amount += pld.RegistrationFee

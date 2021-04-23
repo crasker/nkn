@@ -24,10 +24,11 @@ type ILedgerStore interface {
 	GetRegistrant_legacy(name string) ([]byte, error)
 	IsSubscribed(topic string, bucket uint32, subscriber []byte, identifier string) (bool, error)
 	GetSubscription(topic string, bucket uint32, subscriber []byte, identifier string) (string, uint32, error)
-	GetSubscribers(topic string, bucket, offset, limit uint32) ([]string, error)
-	GetSubscribersWithMeta(topic string, bucket, offset, limit uint32) (map[string]string, error)
-	GetSubscribersCount(topic string, bucket uint32) int
-	GetID(publicKey []byte) ([]byte, error)
+	GetSubscribers(topic string, bucket, offset, limit uint32, subscriberHashPrefix []byte) ([]string, error)
+	GetSubscribersWithMeta(topic string, bucket, offset, limit uint32, subscriberHashPrefix []byte) (map[string]string, error)
+	GetSubscribersCount(topic string, bucket uint32, subscriberHashPrefix []byte) int
+	GetID(publicKey []byte, height uint32) ([]byte, error)
+	GetIDVersion(publicKey []byte) ([]byte, byte, error)
 	GetBalance(addr common.Uint160) common.Fixed64
 	GetBalanceByAssetID(addr common.Uint160, assetID common.Uint256) common.Fixed64
 	GetNonce(addr common.Uint160) uint64
